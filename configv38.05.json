@@ -1,0 +1,51 @@
+{
+  "xls_path": "C:\\Users\\abc\\OneDrive\\Documents\\Tools\\MailBoxManagement\\MailboxTables.xlsm",
+  "log_live_path": "C:\\Users\\abc\\Downloads\\emaillogs\\movemail_live.log",
+  "log_bulk_path": "C:\\Users\\abc\\Downloads\\emaillogs\\movemail_bulk.log",
+  "log_invalid_path": "C:\\Users\\abc\\Downloads\\emaillogs\\movemail_invalid.log",
+  "sheet_map": {
+    "KeywordSubject_ToDelete1": {
+      "sheet": "1.ToDelete-KW1",
+      "columns": ["Keyword-Subject-ToDelete1"],
+      "match_field": "subject_only",
+      "destination_name": "ToDelete"
+    },
+    "MyClienteMailAddresses": {
+      "sheet": "2.MyClienteMailAddresses",
+      "column": "MyClienteMailAddresses",
+      "destination_name": "DACS-My"
+    },
+    "DACSNotMineEmail": {
+      "sheet": "3.DACSNotMineEmail",
+      "column": "DACSNotMineEmail",
+      "destination_name": "DACS"   
+    },
+    "MyClientKeywords": {
+      "sheet": "4.MyClientKeywords",
+      "columns": ["Mneumonic", "CIF", "MurexCode", "LEID"],
+      "match_field": "subject_and_body",
+      "destination_name": "DACS-My"   
+    },
+    "DACSNotMineKeyword": {
+      "sheet": "5.DACSNotMineKeywords",
+      "columns": ["Mneumonic", "CIF", "MurexCode", "LEID"],
+      "match_field": "subject_and_body",
+    "destination_name": "DACS"   
+    },
+     "TradeDetailseMailAddresses": {
+      "sheet": "6.TradeEmailExternal",
+      "column": "TradeEmailExternal",
+      "destination_name": "Trade&BO\\Trade"
+    },
+    "KeywordSubject_ToDelete": {
+      "sheet": "7.KeywordSubject_ToDelete",
+      "columns": ["Keyword-Subject-ToDelete"],
+      "match_field": "subject_only",
+      "destination_name": "ToDelete"
+    },
+    "SMTPResolutionCache": {
+      "sheet": "SMTPResolutionCache",
+      "column": null
+    }
+  }
+}
