@@ -726,3 +726,593 @@ class EmailSorter:
     def _get_live_mode_start_filter_time(self):
         """
         Determines the start_time_filter for live mode based on current day of week
+        and an hourly midnight check.
+        """
+        now = datetime.datetime.now()
+        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Calculate base start day for daily/weekly lookback
+        base_start_day = today_midnight
+        weekday = now.weekday() # Monday is 0, Sunday is 6
+
+        if weekday == 0: # Monday, look back to last Friday
+            base_start_day = today_midnight - datetime.timedelta(days=3)
+        elif weekday == 5: # Saturday, look back to Friday
+            base_start_day = today_midnight - datetime.timedelta(days=1)
+        elif weekday == 6: # Sunday, look back to Friday
+            base_start_day = today_midnight - datetime.timedelta(days=2)
+        else: # Tue, Wed, Thu, Fri
+            base_start_day = today_midnight - datetime.timedelta(days=1)
+
+        # Flag to indicate if we should do a midnight check this iteration
+        trigger_midnight_check = False
+
+        if self.last_midnight_check_hour is None:
+            # Always trigger midnight check on the very first run of live mode
+            trigger_midnight_check = True
+            print("Live mode: Initial (first run) midnight check triggered.")
+        elif now.hour != self.last_midnight_check_hour:
+            # If the hour has changed since the last midnight check, trigger one
+            trigger_midnight_check = True
+            print(f"Live mode: Hourly midnight check triggered for new hour {now.hour:02d}.")
+
+        if trigger_midnight_check:
+            start_time_filter = datetime.datetime.combine(base_start_day.date(), datetime.time.min)
+            self.last_midnight_check_hour = now.hour # Update the last checked hour to the current hour
+            print(f"    Processing from {start_time_filter.strftime('%Y-%m-%d %H:%M:%S')}.")
+        else:
+            # If not a midnight check, use the standard 5-minute lookback
+            start_time_filter = now - datetime.timedelta(minutes=5)
+            print(f"Live mode: Standard 5-minute lookback. Processing from {start_time_filter.strftime('%Y-%m-%d %H:%M:%S')}.")
+
+        return start_time_filter
+
+    def process_folder(self, outlook_namespace, folder_to_process, logger, date_filter_time, folder_objects_map):
+        """
+        Processes all emails within a given Outlook folder.
+        Filters emails from the specified date/time onwards.
+        Emails are processed in reverse order to handle deletion/moving without affecting iteration.
+        This method takes outlook_namespace and target folder *objects* as arguments.
+        `date_filter_time` is now a datetime.datetime object.
+        """
+        processed_count = 0
+        folder_name = getattr(folder_to_process, 'Name', 'Unknown')
+        print(f"Starting processing for folder: {folder_name}")
+
+        try:
+            if not hasattr(folder_to_process, 'Items'):
+                self.invalid_logger.error(f"InvalidFolder|{folder_name}|process_folder|Folder object has no 'Items' attribute.")
+                return 0
+
+            messages = folder_to_process.Items
+            messages.Sort("[ReceivedTime]", False) # Sort by ReceivedTime descending
+
+            # Format the datetime object for Outlook's Restrict method
+            date_filter_outlook_str = date_filter_time.strftime('%d/%m/%Y %H:%M %p')
+            filter_string = f"[ReceivedTime] >= '{date_filter_outlook_str}'"
+            print(f"Applying Outlook filter: {filter_string}")
+
+            try:
+                # Use ReceivedTime for filter as it's more reliable than SentOn for filtering when email arrived
+                filtered_messages = messages.Restrict(filter_string)
+                total_messages_to_process = filtered_messages.Count
+                print(f"Found {total_messages_to_process} messages in {folder_name} matching date filter {date_filter_time}.")
+            except Exception as restrict_error:
+                self.invalid_logger.error(f"OutlookFilterError|{folder_name}|process_folder|Failed to apply filter '{filter_string}': {restrict_error}. Processing all messages and filtering manually.")
+                print(f"Warning: Failed to apply Outlook filter: {restrict_error}. Processing all messages and filtering manually.")
+                filtered_messages = messages # Fallback to all messages, then filter manually below
+                total_messages_to_process = messages.Count # Initial count
+
+            current_message_count = filtered_messages.Count
+
+            for i in range(current_message_count, 0, -1):
+                try:
+                    mail = filtered_messages.Item(i)
+
+                    # Ensure mail.ReceivedTime is timezone-naive for comparison to avoid issues
+                    mail_received_time_naive = mail.ReceivedTime.replace(tzinfo=None)
+
+                    # Manual datetime check for robustness if Outlook's Restrict failed or is imprecise
+                    if mail_received_time_naive < date_filter_time:
+                        continue # Skip emails older than the filter time
+
+                    # Pass thread-local Outlook objects to process_email
+                    if self.process_email(outlook_namespace, mail, logger, folder_objects_map):
+                        processed_count += 1
+
+                except Exception as msg_error:
+                    subject = getattr(mail, 'Subject', 'Unknown') or 'NoSubject'
+                    self.invalid_logger.error(f"MessageAccessError|Folder: '{folder_name}', Subject: '{subject}'|process_folder|{msg_error}")
+                    print(f"Error accessing or processing message in {folder_name}: {msg_error}")
+                    continue
+
+        except Exception as e:
+            self.invalid_logger.critical(f"FolderProcessingError|{folder_name}|process_folder|{e}")
+            print(f"Critical error processing folder {folder_name}: {e}")
+            return 0
+
+        return processed_count
+
+    def run_live(self):
+        """
+        Runs the email sorter in live mode, continuously monitoring and
+        processing emails.
+        For the first run, it checks from calculated start day (midnight) or last 5 mins.
+        The frequency is 1 minute, with an hourly midnight reset.
+        """
+        self.live_running = True
+        print("Starting live mode...")
+        self.live_logger.info("Live mode started.")
+
+        outlook_app = None
+        outlook_namespace = None
+
+        # Dictionary to hold all destination folder objects
+        live_folder_objects = {}
+
+        try:
+            pythoncom.CoInitialize()
+            outlook_app = win32com.client.Dispatch("Outlook.Application")
+            outlook_namespace = outlook_app.GetNamespace("MAPI")
+
+            # Initialize all required Outlook folder objects dynamically from config
+            required_dest_paths = set()
+            for rule_name, rule_config in self.config['sheet_map'].items():
+                if 'destination_name' in rule_config:
+                    required_dest_paths.add(rule_config['destination_name'])
+
+            # Also ensure Inbox and Sent Items are available for processing and as potential destinations
+            live_folder_objects["Inbox"] = outlook_namespace.GetDefaultFolder(6)
+            live_folder_objects["Sent Items"] = outlook_namespace.GetDefaultFolder(5)
+
+            # Get or create all other specified destination folders
+            for folder_path in required_dest_paths:
+                # If a folder path is already a direct reference to Inbox or Sent Items, don't re-create.
+                if folder_path.lower() != "inbox" and folder_path.lower() != "sent items":
+                    live_folder_objects[folder_path] = self._get_or_create_outlook_folder(outlook_namespace, folder_path)
+
+            print("Outlook initialized for live mode thread.")
+
+            while self.live_running:
+                # Determine the time filter based on the new scheduling logic
+                start_time_filter = self._get_live_mode_start_filter_time()
+
+                processed_inbox = 0
+                processed_sent = 0
+
+                try:
+                    processed_inbox = self.process_folder(outlook_namespace, live_folder_objects["Inbox"], self.live_logger, start_time_filter, live_folder_objects)
+                    processed_sent = self.process_folder(outlook_namespace, live_folder_objects["Sent Items"], self.live_logger, start_time_filter, live_folder_objects)
+                except Exception as e:
+                    self.invalid_logger.critical(f"LiveModeFatalError||run_live|A critical error occurred in live mode: {e}")
+                    print(f"A critical error occurred in live mode: {e}. Stopping.")
+                    self.live_running = False
+
+                total_processed = processed_inbox + processed_sent
+                if total_processed > 0:
+                    print(f"Processed {total_processed} emails in live mode. Sleeping for 60 seconds...")
+                else:
+                    print("No new emails to process in live mode. Sleeping for 60 seconds...")
+
+                # Sleep for 1 minute (60 seconds)
+                for _ in range(60): # Loop for 60 seconds, checking stop_live flag
+                    if not self.live_running:
+                        print("Live mode stopped by user request during sleep.")
+                        break
+                    time.sleep(1)
+
+        except Exception as e:
+            self.invalid_logger.critical(f"LiveThreadSetupError||run_live|Failed to set up Outlook in live mode thread: {e}")
+            print(f"Failed to set up Outlook in live mode thread: {e}. Live mode aborted.")
+            self.live_running = False
+
+        finally:
+            self.live_logger.info("Live mode stopped.")
+            print("Live mode gracefully stopped.")
+            # Clean up COM objects for live mode
+            if outlook_app:
+                # Release specific folder objects first
+                for folder_obj in live_folder_objects.values():
+                    try: del folder_obj
+                    except Exception as e: self.invalid_logger.warning(f"COMObjectCleanup|run_live|Failed to delete folder object: {e}")
+
+                # Then release namespace and app
+                try: del outlook_namespace
+                except Exception as e: self.invalid_logger.warning(f"COMObjectCleanup|run_live|Failed to delete namespace object: {e}")
+                try: del outlook_app
+                except Exception as e: self.invalid_logger.warning(f"COMObjectCleanup|run_live|Failed to delete outlook app object: {e}")
+            if 'pythoncom' in globals():
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception as e:
+                    self.invalid_logger.error(f"COMUninitializeError|run_live|Failed to uninitialize COM: {e}")
+                    print(f"Warning: Failed to uninitialize COM in live mode: {e}")
+
+    def stop_live(self):
+        """Signals the live mode to stop its execution loop."""
+        self.live_running = False
+        print("Stopping live mode...")
+
+    def run_bulk(self, start_date, end_date): # Bulk mode now accepts start_date and end_date
+        """Runs the email sorter in bulk mode for a specified date range."""
+        print(f"Starting bulk processing for date range: {start_date} to {end_date}...")
+        self.bulk_logger.info(f"Bulk mode started for date range: {start_date} to {end_date}.")
+
+        outlook_app = None
+        outlook_namespace = None
+
+        # Dictionary to hold all destination folder objects for bulk mode
+        bulk_folder_objects = {}
+
+        processed_inbox = 0
+        processed_sent = 0
+
+        try:
+            pythoncom.CoInitialize()
+            outlook_app = win32com.client.Dispatch("Outlook.Application")
+            outlook_namespace = outlook_app.GetNamespace("MAPI")
+
+            # Initialize all required Outlook folder objects dynamically from config
+            required_dest_paths = set()
+            for rule_name, rule_config in self.config['sheet_map'].items():
+                if 'destination_name' in rule_config:
+                    required_dest_paths.add(rule_config['destination_name'])
+
+            # Also ensure Inbox and Sent Items are available for processing and as potential destinations
+            bulk_folder_objects["Inbox"] = outlook_namespace.GetDefaultFolder(6)
+            bulk_folder_objects["Sent Items"] = outlook_namespace.GetDefaultFolder(5)
+
+            # Get or create all other specified destination folders
+            for folder_path in required_dest_paths:
+                if folder_path.lower() != "inbox" and folder_path.lower() != "sent items":
+                    bulk_folder_objects[folder_path] = self._get_or_create_outlook_folder(outlook_namespace, folder_path)
+
+            print("Outlook initialized for bulk mode thread.")
+
+            # Convert selected dates (datetime.date) to datetime.datetime at midnight
+            bulk_start_time_filter = datetime.datetime.combine(start_date, datetime.time.min)
+            # End date filter needs to be up to the end of the day, so add almost one day
+            bulk_end_time_filter = datetime.datetime.combine(end_date, datetime.time.max) # Max time for the end date
+
+            # Process Inbox
+            processed_inbox = self.process_folder_bulk(outlook_namespace, bulk_folder_objects["Inbox"], self.bulk_logger, bulk_start_time_filter, bulk_end_time_filter, bulk_folder_objects)
+            # Process Sent Items
+            processed_sent = self.process_folder_bulk(outlook_namespace, bulk_folder_objects["Sent Items"], self.bulk_logger, bulk_start_time_filter, bulk_end_time_filter, bulk_folder_objects)
+
+        except Exception as e:
+            self.invalid_logger.critical(f"BulkModeFatalError||run_bulk|A critical error occurred in bulk mode: {e}")
+            print(f"A critical error occurred in bulk mode: {e}.")
+
+        finally:
+            total_processed = processed_inbox + processed_sent
+            print(f"Bulk processing completed. Processed {total_processed} emails for {start_date} to {end_date}.")
+            self.bulk_logger.info(f"Bulk mode completed for date range: {start_date} to {end_date}. Processed {total_processed} emails.")
+
+            messagebox.showinfo("Bulk Processing Complete",
+                                f"Processed {total_processed} emails for {start_date} to {end_date}\n"
+                                f"Inbox: {processed_inbox} emails\n"
+                                f"Sent Items: {processed_sent} emails")
+            # Clean up COM objects for bulk mode
+            if outlook_app:
+                for folder_obj in bulk_folder_objects.values():
+                    try: del folder_obj
+                    except Exception as e: self.invalid_logger.warning(f"COMObjectCleanup|run_bulk|Failed to delete folder object: {e}")
+
+                try: del outlook_namespace
+                except Exception as e: self.invalid_logger.warning(f"COMObjectCleanup|run_bulk|Failed to delete namespace object: {e}")
+                try: del outlook_app
+                except Exception as e: self.invalid_logger.warning(f"COMObjectCleanup|run_bulk|Failed to delete outlook app object: {e}")
+            if 'pythoncom' in globals():
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception as e:
+                    self.invalid_logger.error(f"COMUninitializeError|run_bulk|Failed to uninitialize COM: {e}")
+                    print(f"Warning: Failed to uninitialize COM in bulk mode: {e}")
+
+    # New method for bulk mode folder processing with start and end dates
+    def process_folder_bulk(self, outlook_namespace, folder_to_process, logger, start_date_time, end_date_time, folder_objects_map):
+        """
+        Processes all emails within a given Outlook folder for a specific date range.
+        Emails are processed in reverse order to handle deletion/moving without affecting iteration.
+        """
+        processed_count = 0
+        folder_name = getattr(folder_to_process, 'Name', 'Unknown')
+        print(f"Starting bulk processing for folder: {folder_name} from {start_date_time} to {end_date_time}")
+
+        try:
+            if not hasattr(folder_to_process, 'Items'):
+                self.invalid_logger.error(f"InvalidFolder|{folder_name}|process_folder_bulk|Folder object has no 'Items' attribute.")
+                return 0
+
+            messages = folder_to_process.Items
+            messages.Sort("[ReceivedTime]", False) # Sort by ReceivedTime descending
+
+            # Use both start and end date filters for Outlook's Restrict method
+            start_date_outlook_str = start_date_time.strftime('%d/%m/%Y %H:%M %p')
+            end_date_outlook_str = end_date_time.strftime('%d/%m/%Y %H:%M %p')
+
+            filter_string = f"[ReceivedTime] >= '{start_date_outlook_str}' AND [ReceivedTime] <= '{end_date_outlook_str}'"
+            print(f"Applying Outlook filter: {filter_string}")
+
+            try:
+                filtered_messages = messages.Restrict(filter_string)
+                total_messages_to_process = filtered_messages.Count
+                print(f"Found {total_messages_to_process} messages in {folder_name} matching date range filter.")
+            except Exception as restrict_error:
+                self.invalid_logger.error(f"OutlookFilterError|{folder_name}|process_folder_bulk|Failed to apply filter '{filter_string}': {restrict_error}. Processing all messages and filtering manually.")
+                print(f"Warning: Failed to apply Outlook filter: {restrict_error}. Processing all messages and filtering manually.")
+                filtered_messages = messages # Fallback to all messages, then filter manually below
+                total_messages_to_process = messages.Count # Initial count
+
+            current_message_count = filtered_messages.Count
+
+            for i in range(current_message_count, 0, -1):
+                try:
+                    mail = filtered_messages.Item(i)
+
+                    mail_received_time_naive = mail.ReceivedTime.replace(tzinfo=None)
+
+                    # Manual datetime check for robustness if Outlook's Restrict failed or is imprecise
+                    if not (start_date_time <= mail_received_time_naive <= end_date_time):
+                        continue # Skip emails outside the desired range
+
+                    if self.process_email(outlook_namespace, mail, logger, folder_objects_map):
+                        processed_count += 1
+
+                except Exception as msg_error:
+                    subject = getattr(mail, 'Subject', 'Unknown') or 'NoSubject'
+                    self.invalid_logger.error(f"MessageAccessError|Folder: '{folder_name}', Subject: '{subject}'|process_folder_bulk|{msg_error}")
+                    print(f"Error accessing or processing message in {folder_name}: {msg_error}")
+                    continue
+
+        except Exception as e:
+            self.invalid_logger.critical(f"FolderProcessingError|{folder_name}|process_folder_bulk|{e}")
+            print(f"Critical error processing folder {folder_name}: {e}")
+            return 0
+
+        return processed_count
+
+    def save_smtp_cache(self):
+        """
+        Saves newly resolved SMTP entries to the 'SMTPResolutionCache' sheet in the Excel file.
+        Implements a retry mechanism with a user prompt if the file is locked.
+        """
+        if not self.new_smtp_entries:
+            print("No new SMTP entries to save.")
+            return
+
+        saved_successfully = False
+        while not saved_successfully:
+            try:
+                # Attempt to load the workbook
+                wb = openpyxl.load_workbook(self.xls_path, keep_vba=True)
+
+                cache_sheet_name = self.config['sheet_map']['SMTPResolutionCache']['sheet']
+                if cache_sheet_name not in wb.sheetnames:
+                    ws = wb.create_sheet(cache_sheet_name)
+                    ws.append(['EntryName', 'SMTPAddress'])
+                    print(f"Created new sheet '{cache_sheet_name}' for SMTP cache.")
+                else:
+                    ws = wb[cache_sheet_name]
+                    # Check if headers exist, if not, add them
+                    if ws.max_row == 0 or ws.cell(row=1, column=1).value not in ['EntryName', 'entryname', 'EntryName']:
+                        ws.insert_rows(1)
+                        ws.cell(row=1, column=1, value='EntryName')
+                        ws.cell(row=1, column=2, value='SMTPAddress')
+                        print(f"Added headers to existing sheet '{cache_sheet_name}'.")
+
+                existing_entries = set()
+                # Read existing entries starting from the second row (after headers)
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if row and row[0]:
+                        existing_entries.add(str(row[0]).lower())
+
+                entries_added = 0
+                for entry_name, smtp_address in self.new_smtp_entries.items():
+                    if entry_name not in existing_entries:
+                        ws.append([entry_name, smtp_address])
+                        existing_entries.add(entry_name)
+                        entries_added += 1
+                    else:
+                        print(f"Skipping existing SMTP cache entry: {entry_name}")
+
+                if entries_added > 0:
+                    wb.save(self.xls_path)
+                    print(f"Saved {entries_added} new SMTP entries to '{cache_sheet_name}' in '{self.xls_path}'.")
+                else:
+                    print("No *new* unique SMTP entries were added to the cache.")
+
+                wb.close()
+                self.new_smtp_entries.clear()
+                saved_successfully = True # Set flag to exit loop
+
+            except PermissionError as e:
+                error_msg = f"Failed to save SMTP cache: Excel file is currently open. Error: {e}"
+                self.invalid_logger.error(f"CacheSaveError||save_smtp_cache|{error_msg}")
+                print(error_msg)
+
+                # Prompt user to close the file
+                retry_choice = messagebox.askokcancel(
+                    "Excel File Locked",
+                    f"The Excel file '{os.path.basename(self.xls_path)}' is currently open.\n"
+                    "Please close the file to save the SMTP cache.\n\n"
+                    "Click OK to retry, or Cancel to skip saving this time."
+                )
+
+                if not retry_choice: # User clicked Cancel
+                    print("Saving SMTP cache skipped by user.")
+                    self.invalid_logger.info("CacheSaveSkipped|save_smtp_cache|User skipped saving SMTP cache due to file lock.")
+                    break # Exit the while loop without saving
+                else:
+                    # User clicked OK, loop will continue for another attempt
+                    print("Retrying save operation...")
+                    time.sleep(2) # Give a small pause before retrying
+
+            except Exception as e:
+                error_msg = f"An unexpected error occurred while saving SMTP cache: {e}"
+                self.invalid_logger.critical(f"CacheSaveError||save_smtp_cache|{error_msg}")
+                print(error_msg)
+                messagebox.showerror("Cache Save Error", error_msg)
+                break # Exit the while loop on unexpected error
+
+    def start_gui(self):
+        """Starts the main Tkinter GUI for the Email Sorter."""
+        root = tk.Tk()
+        root.title("Email Sorter v38.10") # Updated title for version
+        root.geometry("350x450")
+        root.resizable(False, False)
+        root.attributes('-topmost', True)
+
+        header_label = tk.Label(root, text="Email Sorter", font=("Arial", 16, "bold"), fg="#333333")
+        header_label.pack(pady=15)
+
+        info_label = tk.Label(root, text="Choose operation mode:", font=("Arial", 10), fg="#555555")
+        info_label.pack(pady=5)
+
+        def pick_bulk():
+            """Handles bulk mode selection, prompting for a date range."""
+            cal_win = tk.Toplevel(root)
+            cal_win.title("Select Date Range for Bulk Processing")
+            cal_win.geometry("350x550")
+            cal_win.resizable(False, False)
+            cal_win.attributes('-topmost', True)
+            cal_win.grab_set()
+
+            # Start Date selection
+            start_date_label = tk.Label(cal_win, text="Select Start Date:", font=("Arial", 10))
+            start_date_label.pack(pady=(10, 0))
+            cal_start = Calendar(cal_win, selectmode='day', date_pattern='yyyy-mm-dd',
+                                background="blue", foreground="white",
+                                headersbackground="blue", headersforeground="white",
+                                selectbackground="green", selectforeground="white",
+                                normalbackground="lightgray", weekendbackground="darkgray")
+            cal_start.pack(pady=(0, 10))
+
+            # End Date selection
+            end_date_label = tk.Label(cal_win, text="Select End Date:", font=("Arial", 10))
+            end_date_label.pack(pady=(10, 0))
+
+            # Checkbox for "End Date as Today"
+            end_date_today_var = tk.BooleanVar(value=True)
+            end_date_checkbox = tk.Checkbutton(cal_win, text="End Date as Today", variable=end_date_today_var,
+                                               font=("Arial", 9))
+            end_date_checkbox.pack(anchor=tk.W, padx=10)
+
+            cal_end = Calendar(cal_win, selectmode='day', date_pattern='yyyy-mm-dd',
+                              background="blue", foreground="white",
+                              headersbackground="blue", headersforeground="white",
+                              selectbackground="green", selectforeground="white",
+                              normalbackground="lightgray", weekendbackground="darkgray")
+            cal_end.pack(pady=(0, 10))
+
+            # Function to toggle end date calendar state based on checkbox
+            def toggle_end_date_calendar():
+                if end_date_today_var.get():
+                    cal_end.config(state='disabled')
+                else:
+                    cal_end.config(state='normal')
+            end_date_today_var.trace_add("write", lambda *args: toggle_end_date_calendar())
+            toggle_end_date_calendar()
+
+            def validate_dates_and_process():
+                selected_start_date = cal_start.selection_get()
+
+                if end_date_today_var.get():
+                    selected_end_date = datetime.date.today()
+                else:
+                    selected_end_date = cal_end.selection_get()
+
+                today = datetime.date.today()
+
+                if selected_start_date > today:
+                    messagebox.showerror("Invalid Date", "Start Date cannot be in the future.")
+                    return
+                if selected_end_date > today:
+                    messagebox.showerror("Invalid Date", "End Date cannot be in the future.")
+                    return
+                if selected_start_date > selected_end_date:
+                    messagebox.showerror("Invalid Date Range", "Start Date cannot be after End Date.")
+                    return
+
+                cal_win.destroy()
+                root.destroy()
+                threading.Thread(target=lambda: self.run_bulk(selected_start_date, selected_end_date), daemon=True).start()
+
+            button_frame = tk.Frame(cal_win)
+            button_frame.pack(pady=10)
+
+            tk.Button(button_frame, text="Process", command=validate_dates_and_process,
+                      bg="#28a745", fg="white", width=12, height=1,
+                      font=("Arial", 10, "bold"), relief=tk.RAISED).pack(side=tk.LEFT, padx=10)
+            tk.Button(button_frame, text="Cancel", command=cal_win.destroy,
+                      bg="#dc3545", fg="white", width=12, height=1,
+                      font=("Arial", 10, "bold"), relief=tk.RAISED).pack(side=tk.LEFT, padx=10)
+
+        def pick_live():
+            """Handles live mode selection, starting continuous monitoring."""
+            root.destroy()
+
+            live_win = tk.Tk()
+            live_win.title("Live Mode - Email Sorter")
+            live_win.geometry("320x160")
+            live_win.resizable(False, False)
+            live_win.attributes('-topmost', True)
+
+            status_label = tk.Label(live_win, text="Live monitoring active...",
+                                     font=("Arial", 12, "bold"), fg="green")
+            status_label.pack(pady=20)
+
+            info_label = tk.Label(live_win, text="Emails are being processed automatically in the background.",
+                                   font=("Arial", 9), fg="#666666")
+            info_label.pack(pady=5)
+
+            def stop_and_close():
+                self.stop_live()
+                # Calling save_smtp_cache, which now handles the prompt
+                self.save_smtp_cache()
+                live_win.destroy()
+
+            tk.Button(live_win, text="Stop Live Mode", command=stop_and_close,
+                      bg="#dc3545", fg="white", width=18, height=1,
+                      font=("Arial", 10, "bold"), relief=tk.RAISED).pack(pady=20)
+
+            threading.Thread(target=self.run_live, daemon=True).start()
+
+            live_win.protocol("WM_DELETE_WINDOW", stop_and_close)
+            live_win.mainloop()
+
+        button_frame = tk.Frame(root)
+        button_frame.pack(pady=20)
+
+        tk.Button(button_frame, text="Run Live Mode", command=pick_live,
+                  bg="#007bff", fg="white", width=18, height=2,
+                  font=("Arial", 11, "bold"), relief=tk.RAISED).pack(pady=8)
+        tk.Button(button_frame, text="Run Bulk Mode", command=pick_bulk,
+                  bg="#ffc107", fg="white", width=18, height=2,
+                  font=("Arial", 11, "bold"), relief=tk.RAISED).pack(pady=8)
+
+        footer_label = tk.Label(root, text="Live: Monitors emails based on smart schedule | Bulk: Process selected date range",
+                                 font=("Arial", 8), fg="gray")
+        footer_label.pack(side=tk.BOTTOM, pady=10)
+
+        def on_closing():
+            if messagebox.askyesno("Exit", "Do you want to save the SMTP cache before exiting? (Recommended)"):
+                self.save_smtp_cache()
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", on_closing)
+        root.mainloop()
+
+def main():
+    """Main function to run the Email Sorter application."""
+    sorter = None
+    try:
+        sorter = EmailSorter()
+        sorter.start_gui()
+    except Exception as e:
+        print(f"Error starting Email Sorter application: {e}")
+        if sorter and sorter.invalid_logger:
+            sorter.invalid_logger.critical(f"AppStartupError||main|{e}")
+
+if __name__ == "__main__":
+    main()
