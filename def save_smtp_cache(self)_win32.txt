@@ -1,0 +1,90 @@
+def save_smtp_cache(self):
+    if not self.new_smtp_entries:
+        return
+    
+    saved_successfully = False
+    while not saved_successfully:
+        try:
+            cache_sheet_name = self.config['sheet_map']['SMTPResolutionCache']['sheet']
+            
+            # Use win32com to read MSIP labels first
+            import win32com.client as win32
+            excel = win32.gencache.EnsureDispatch('Excel.Application')
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            
+            # Open workbook
+            wb = excel.Workbooks.Open(self.smtp_cache_path)
+            
+            # Read existing data
+            ws = wb.Sheets(cache_sheet_name)
+            last_row = ws.Cells(ws.Rows.Count, 1).End(-4162).Row
+            
+            # Store existing data
+            data = []
+            if last_row >= 1:
+                for i in range(1, last_row + 1):
+                    row_data = [
+                        ws.Cells(i, 1).Value,
+                        ws.Cells(i, 2).Value
+                    ]
+                    data.append(row_data)
+            
+            # Add new entries
+            existing_entries = {str(row[0]).lower() for row in data[1:] if row[0]}  # Skip header
+            
+            for entry_name, smtp_address in self.new_smtp_entries.items():
+                if entry_name not in existing_entries:
+                    data.append([entry_name, smtp_address])
+            
+            # Create a new temporary file with the data
+            temp_path = self.smtp_cache_path + '.temp.xlsx'
+            temp_wb = openpyxl.Workbook()
+            temp_ws = temp_wb.active
+            temp_ws.title = cache_sheet_name
+            
+            for row in data:
+                temp_ws.append(row)
+            
+            temp_wb.save(temp_path)
+            temp_wb.close()
+            
+            # Close the original workbook
+            wb.Close()
+            excel.Quit()
+            
+            # Use win32com to copy MSIP labels from original to temp
+            excel2 = win32.gencache.EnsureDispatch('Excel.Application')
+            excel2.Visible = False
+            excel2.DisplayAlerts = False
+            
+            # Open both workbooks
+            original_wb = excel2.Workbooks.Open(self.smtp_cache_path)
+            temp_wb = excel2.Workbooks.Open(temp_path)
+            
+            # Copy custom document properties (where MSIP labels often live)
+            for i in range(1, original_wb.CustomDocumentProperties.Count + 1):
+                prop = original_wb.CustomDocumentProperties(i)
+                try:
+                    temp_wb.CustomDocumentProperties.Add(
+                        prop.Name, False, prop.Type, prop.Value
+                    )
+                except:
+                    pass  # Property might already exist
+            
+            # Save temp over original
+            temp_wb.SaveAs(self.smtp_cache_path, FileFormat=52)  # 52 = xlOpenXMLWorkbookMacroEnabled
+            temp_wb.Close()
+            original_wb.Close()
+            excel2.Quit()
+            
+            # Clean up temp file
+            os.remove(temp_path)
+            
+            self.new_smtp_entries.clear()
+            saved_successfully = True
+            print(f"Saved {entries_added} new SMTP entries with MSIP labels preserved.")
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            # Handle retry logic...
