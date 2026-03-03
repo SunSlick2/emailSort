@@ -1,0 +1,113 @@
+def save_smtp_cache(self):
+    """
+    Saves newly resolved SMTP entries using xlwings for proper MSIP label preservation.
+    Only opens/closes the specific cache file without affecting other Excel instances.
+    """
+    if not self.new_smtp_entries:
+        print("No new SMTP entries to save.")
+        return
+
+    saved_successfully = False
+    while not saved_successfully:
+        app = None
+        wb = None
+        try:
+            import xlwings as xw
+            
+            cache_sheet_name = self.config['sheet_map']['SMTPResolutionCache']['sheet']
+            
+            # Create a new Excel instance that won't interfere with existing ones
+            app = xw.App(visible=False, add_book=False)
+            
+            # Open only our specific cache file
+            wb = app.books.open(self.smtp_cache_path)
+            
+            # Get the cache sheet
+            ws = wb.sheets[cache_sheet_name]
+            
+            # Read existing data
+            used_range = ws.used_range
+            if used_range.value is None:
+                # Empty sheet, create headers
+                ws.range('A1').value = ['EntryName', 'SMTPAddress']
+                existing_entries = set()
+                next_row = 2
+            else:
+                # Get all data
+                data = used_range.value
+                if not data or len(data) == 0:
+                    existing_entries = set()
+                    next_row = 2
+                else:
+                    # Handle case where data is just a single row/column
+                    if isinstance(data, list):
+                        if len(data) > 1 and isinstance(data[0], list):
+                            # Multi-row data
+                            existing_entries = {str(row[0]).strip().lower() for row in data[1:] if row and row[0]}
+                            next_row = len(data) + 1
+                        elif len(data) > 1:
+                            # Single column data? Handle gracefully
+                            existing_entries = set()
+                            next_row = len(data) + 1
+                        else:
+                            existing_entries = set()
+                            next_row = 2
+                    else:
+                        # Single cell
+                        existing_entries = set()
+                        next_row = 2
+            
+            # Add new entries
+            entries_added = 0
+            for entry_name, smtp_address in self.new_smtp_entries.items():
+                entry_key = entry_name.strip().lower()
+                if entry_key not in existing_entries:
+                    ws.range(f'A{next_row}').value = entry_name
+                    ws.range(f'B{next_row}').value = smtp_address
+                    existing_entries.add(entry_key)
+                    next_row += 1
+                    entries_added += 1
+                    print(f"Adding new cache entry: {entry_name} -> {smtp_address}")
+            
+            if entries_added > 0:
+                # Save only this specific workbook
+                wb.save()
+                print(f"Saved {entries_added} new SMTP entries using xlwings.")
+                self.invalid_logger.info(f"SMTPCacheSave|save_smtp_cache|Saved {entries_added} new entries.")
+            else:
+                print("No new SMTP entries to add.")
+            
+            # Close just our workbook and the dedicated app instance
+            wb.close()
+            app.quit()
+            
+            self.new_smtp_entries.clear()
+            saved_successfully = True
+            
+        except Exception as e:
+            error_msg = f"Error saving SMTP cache: {e}"
+            print(error_msg)
+            self.invalid_logger.error(f"CacheSaveError||save_smtp_cache|{error_msg}")
+            
+            # Clean up our specific instances only
+            try:
+                if wb:
+                    wb.close()
+            except:
+                pass
+            try:
+                if app:
+                    app.quit()
+            except:
+                pass
+            
+            # Retry logic
+            retry_choice = messagebox.askretrycancel(
+                "Cache Save Error",
+                f"Failed to save SMTP cache: {str(e)}\n\nClick Retry to try again, or Cancel to skip."
+            )
+            
+            if not retry_choice:
+                break
+            else:
+                time.sleep(1)  # Brief pause before retry
