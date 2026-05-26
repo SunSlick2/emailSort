@@ -1,0 +1,219 @@
+Following code loads and saves data from excel spreadsheet. It runs 24x7
+
+def _load_smtp_cache(self):
+        """Loads SMTP resolution cache from the separate SMTP cache Excel file."""
+        cache_sheet_name = self.config['sheet_map']['SMTPResolutionCache']['sheet']
+        
+        # Check if the SMTP cache file exists
+        if not os.path.exists(self.smtp_cache_path):
+            self.invalid_logger.warning(
+                f"SMTP cache file '{self.smtp_cache_path}' not found. Starting with empty cache."
+            )
+            return {}
+        
+        try:
+            # Use pandas to read just the cache sheet to avoid loading entire workbook
+            cache_df = pd.read_excel(self.smtp_cache_path, sheet_name=cache_sheet_name, dtype=str, engine='openpyxl')
+            
+            if 'EntryName' in cache_df.columns and 'SMTPAddress' in cache_df.columns:
+                return dict(zip(
+                    cache_df['EntryName'].fillna('').astype(str).str.lower(),
+                    cache_df['SMTPAddress'].fillna('').astype(str).str.lower()
+                ))
+            else:
+                self.invalid_logger.warning(
+                    f"Missing 'EntryName' or 'SMTPAddress' columns in '{cache_sheet_name}' sheet. "
+                    "SMTP cache will not be loaded."
+                )
+                return {}
+        except Exception as e:
+            self.invalid_logger.error(f"SMTPCacheLoadError||_load_smtp_cache|Failed to load SMTP cache: {e}")
+            return {}
+
+
+def save_smtp_cache(self):
+    """
+    Saves newly resolved SMTP entries using xlwings for proper MSIP label preservation.
+    If saving to Excel fails and the user cancels retry, offers to save as a TXT file.
+    """
+    import os
+    import time
+    from tkinter import messagebox
+
+    if not self.new_smtp_entries:
+        print("No new SMTP entries to save.")
+        return
+
+    cache_sheet_name = self.config['sheet_map']['SMTPResolutionCache']['sheet']
+    txt_fallback_dir = r"C:\Users\abc\Downloads"
+    txt_fallback_path = os.path.join(txt_fallback_dir, "SMTP_cache_fallback.txt")
+
+    saved_successfully = False
+    while not saved_successfully:
+        app = None
+        wb = None
+        try:
+            import xlwings as xw
+
+            # Create a new Excel instance that won't interfere with existing ones
+            app = xw.App(visible=False, add_book=False)
+
+            # Open only our specific cache file
+            wb = app.books.open(self.smtp_cache_path)
+
+            # Get the cache sheet
+            ws = wb.sheets[cache_sheet_name]
+
+            # Read existing data
+            used_range = ws.used_range
+            if used_range.value is None:
+                # Empty sheet, create headers
+                ws.range('A1').value = ['EntryName', 'SMTPAddress']
+                existing_entries = set()
+                next_row = 2
+            else:
+                # Get all data
+                data = used_range.value
+                if not data or len(data) == 0:
+                    existing_entries = set()
+                    next_row = 2
+                else:
+                    # Handle case where data is just a single row/column
+                    if isinstance(data, list):
+                        if len(data) > 1 and isinstance(data[0], list):
+                            # Multi-row data
+                            existing_entries = {
+                                str(row[0]).strip().lower()
+                                for row in data[1:]
+                                if row and row[0]
+                            }
+                            next_row = len(data) + 1
+                        elif len(data) > 1:
+                            # Single column data
+                            existing_entries = {
+                                str(row).strip().lower()
+                                for row in data[1:]
+                                if row
+                            }
+                            next_row = len(data) + 1
+                        else:
+                            existing_entries = set()
+                            next_row = 2
+                    else:
+                        # Single cell
+                        existing_entries = set()
+                        next_row = 2
+
+            # Add new entries
+            entries_added = 0
+            for entry_name, smtp_address in self.new_smtp_entries.items():
+                entry_key = entry_name.strip().lower()
+                if entry_key not in existing_entries:
+                    ws.range(f'A{next_row}').value = entry_name
+                    ws.range(f'B{next_row}').value = smtp_address
+                    existing_entries.add(entry_key)
+                    next_row += 1
+                    entries_added += 1
+                    print(f"Adding new cache entry: {entry_name} -> {smtp_address}")
+
+            if entries_added > 0:
+                wb.save()
+                time.sleep(1)  # small delay to ensure write completes
+                print(f"Saved {entries_added} new SMTP entries using xlwings.")
+                self.invalid_logger.info(
+                    f"SMTPCacheSave|save_smtp_cache|Saved {entries_added} new entries."
+                )
+            else:
+                print("No new SMTP entries to add.")
+
+            # Close workbook and app instance
+            wb.close()
+            app.quit()
+
+            self.new_smtp_entries.clear()
+            saved_successfully = True
+
+        except Exception as e:
+            error_msg = f"Error saving SMTP cache: {e}"
+            print(error_msg)
+            self.invalid_logger.error(f"CacheSaveError||save_smtp_cache|{error_msg}")
+
+            # Clean up our specific instances only
+            try:
+                if wb:
+                    wb.close()
+            except Exception:
+                pass
+            try:
+                if app:
+                    app.quit()
+            except Exception:
+                pass
+
+            # Ask user if they want to retry Excel save
+            retry_choice = messagebox.askretrycancel(
+                "Cache Save Error",
+                f"Failed to save SMTP cache: {str(e)}\n\n"
+                "Click Retry to try again, or Cancel to choose an alternative TXT save."
+            )
+
+            if not retry_choice:
+                # Offer TXT fallback
+                txt_msg = (
+                    "Unable to save SMTP cache to Excel.\n\n"
+                    f"Do you want to save the new entries as a TXT file in:\n"
+                    f"{txt_fallback_dir}\n\n"
+                    "Each line will contain: EntryName<TAB>SMTPAddress."
+                )
+                txt_choice = messagebox.askyesno(
+                    "Save Cache as TXT",
+                    txt_msg
+                )
+
+                if txt_choice:
+                    try:
+                        # Ensure directory exists
+                        os.makedirs(txt_fallback_dir, exist_ok=True)
+
+                        # Append or create file
+                        with open(txt_fallback_path, "a", encoding="utf-8") as f:
+                            for entry_name, smtp_address in self.new_smtp_entries.items():
+                                line = f"{entry_name}\t{smtp_address}\n"
+                                f.write(line)
+
+                        self.invalid_logger.info(
+                            f"SMTPCacheSaveFallback|save_smtp_cache|"
+                            f"Saved {len(self.new_smtp_entries)} entries to TXT: {txt_fallback_path}"
+                        )
+                        print(
+                            f"Saved {len(self.new_smtp_entries)} SMTP entries to TXT file: {txt_fallback_path}"
+                        )
+                        # Clear entries after fallback save
+                        self.new_smtp_entries.clear()
+                    except Exception as txt_e:
+                        txt_error_msg = f"Error saving fallback TXT cache: {txt_e}"
+                        print(txt_error_msg)
+                        self.invalid_logger.error(
+                            f"CacheSaveFallbackError||save_smtp_cache|{txt_error_msg}"
+                        )
+                # Either way, break out of main loop (no further retries)
+                break
+            else:
+                # User chose to retry Excel save, small delay before retry
+                time.sleep(1)
+
+
+
+It is prone to following error
+
+---------------------------
+Cache Save Error
+---------------------------
+Failed to save SMTP cache: module 'win32com.gen_py.00020813-0000-0000-C000-000000000046x0x1x9' has no attribute 'CLSIDToPackageMap'
+
+Click Retry to try again, or Cancel to skip.
+---------------------------
+Retry   Cancel   
+---------------------------
+
+what is the root cause of the error. 
